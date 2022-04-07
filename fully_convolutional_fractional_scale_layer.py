@@ -141,8 +141,10 @@ class FullyConvolutionalFractionalScaling2D(torch.nn.Module):
     def __init__(self,
                  r:             int,
                  s:             int,
-                 scaling_mode: str='nearest') -> None:
+                 scaling_mode: str='nearest',
+                 is_inner_layer: bool=False) -> None:
         super(FullyConvolutionalFractionalScaling2D, self).__init__()
+        self.is_inner_layer = is_inner_layer
         self.scaling_modes = {
             'bicubic':  self.fill_weights_BiQubic,
             'nearest':  self.fill_weights_NN,
@@ -150,22 +152,29 @@ class FullyConvolutionalFractionalScaling2D(torch.nn.Module):
         }
         self.conv3d = self.scaling_modes[scaling_mode](r, s).to("cuda:0") #self.fill_weights_BiLInear(r, s)
         self.pixelshuffle = torch.nn.PixelShuffle(upscale_factor=r)
-        self(torch.Tensor(np.zeros((1,1024,1024,3))).to('cuda:0'))
+        # self(torch.Tensor(np.zeros((1,1024,1024,3))).to('cuda:0'))
 
     def forward(self,input: torch.Tensor) -> torch.Tensor:
         reduce_dim = False
-        if len(input.shape) == 3:
-            input = input[None, ...]
-            reduce_dim = True
-        x = torch.permute(input, (0,3,1,2))
+        if not self.is_inner_layer:
+            if len(input.shape) == 3:
+                reduce_dim = True
+                input = input[None, ...]
+            x = torch.permute(input, (0,3,1,2))
+        else:
+            x = input
         x = x[:, None, :, :, :]
         x = self.conv3d(x)
         x = torch.permute(x, (0,2,1,3,4))
         x = self.pixelshuffle(x)
         x = torch.squeeze(x, 2)
-        res = torch.permute(x, (0,2,3,1))
-        if reduce_dim:
-            res = res[0]
+        if not self.is_inner_layer:
+            res = torch.permute(x, (0,2,3,1))
+            if reduce_dim:
+                res = res[0]
+        else:
+            res = x
+        # print(res.shape)
         return res
 
 
@@ -178,46 +187,5 @@ class FullyConvolutionalFractionalScaling2D(torch.nn.Module):
 # FCFS0 = FullyConvolutionalFractionalScaling2D(r=3,s=2,scaling_mode='bicubic') # downsampling by factor 2/3
 #     FCFS1 = FullyConvolutionalFractionalScaling2D(r=23,s=5,scaling_mode='bilinear') # downsampling by factor 2/3
 #     FCFS2 = FullyConvolutionalFractionalScaling2D(r=23,s=3,scaling_mode='bicubic') # downsampling by factor 2/3
-#     torch0 = torchvision.transforms.Resize(size=(5221,5224), interpolation=torchvision.transforms.InterpolationMode.NEAREST)
-#     torch1 = torchvision.transforms.Resize(size=(5221,5224), interpolation=torchvision.transforms.InterpolationMode.BILINEAR)
-#     torch2 = torchvision.transforms.Resize(size=(5221,5224), interpolation=torchvision.transforms.InterpolationMode.BICUBIC)
-#     times.append(time.time())
-#     B = FCFS0(torch.Tensor(A))
-#     # print(B.shape)
-#     # plt.figure(0)
-#     # plt.imshow(B.detach().numpy().astype(int))
-#
-#     times.append(time.time())
-#     B2 = FCFS1(torch.Tensor(A))
-#     # print(B2.shape)
-#     # plt.figure(1)
-#     # plt.imshow(B2.detach().numpy().astype(int))
-#
-#     times.append(time.time())
-#     B2 = FCFS2(torch.Tensor(A))
-#     # print(B2.shape)
-#     # plt.figure(2)
-#     # plt.imshow(B2.detach().numpy().astype(int))
-#
-#     times.append(time.time())
-#     B2 = torch0(torch.Tensor(A).permute([2, 0, 1]))
-#     # print(B2.shape)
-#     # plt.figure(3)
-#     # plt.imshow(B2.permute([1, 2, 0]).detach().numpy().astype(int))
-#
-#     times.append(time.time())
-#     B2 = torch1(torch.Tensor(A).permute([2, 0, 1]))
-#     # print(B2.shape)
-#     # plt.figure(4)
-#     # plt.imshow(B2.permute([1, 2, 0]).detach().numpy().astype(int))
-#
-#     times.append(time.time())
-#     B2 = torch2(torch.Tensor(A).permute([2, 0, 1]))
-#     # print(B2.shape)
-#     # plt.figure(5)
-#     # plt.imshow(B2.permute([1, 2, 0]).detach().numpy().astype(int))
-#     times.append(time.time())
-#     for t1,t2 in zip(times[:-1],times[1:]):
-#         print(t2 - t1)
-#     plt.show()
+
 # See PyCharm help at https://www.jetbrains.com/help/pycharm/
