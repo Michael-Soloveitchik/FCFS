@@ -4,8 +4,8 @@
 # Press Double Shift to search everywhere for classes, files, tool windows, actions, and settings.
 import cv2
 # import time
-import matplotlib.pyplot as plt
-import torchvision as torchvision
+# import matplotlib.pyplot as plt
+# import torchvision
 import torch
 import torchvision
 from typing import Optional, List, Tuple, Union
@@ -19,25 +19,25 @@ class FullyConvolutionalFractionalScaling2D(torch.nn.Module):
 
     def fill_weights_NN(self)->torch.Tensor:
         # filter values filling
-        kernel_size = self.s
+        kernel_size = self.s+1
         weight = np.zeros([self.r**2,1,1, kernel_size, kernel_size])
-        a = self.s/self.r
-        nearest_neighbours = np.round(np.linspace(a/2,(self.s-1)-(a/2),self.r)).astype(int)
+        a = (self.s/self.r)/2
+        nearest_neighbours = np.round(np.linspace(a,(self.s),self.r)).astype(int)
         nx, ny = np.meshgrid(nearest_neighbours,nearest_neighbours)
-        for r_i, (y, x) in enumerate(zip(nx.flatten(), ny.flatten())):
-            weight[r_i,0, 0, x, y] = 1.
+        for r_sq_i, (y, x) in enumerate(zip(nx.flatten(), ny.flatten())):
+            weight[r_sq_i,0, 0, x, y] = 1.
 
         weight = torch.Tensor(weight)
         return weight
 
 
     def fill_weights_BiLinear(self)->torch.Tensor:
-        kernel_size = self.s
+        kernel_size = self.s+1
         weight = np.zeros([self.r**2,1,1, kernel_size, kernel_size])
-        a = self.s/self.r
-        nearest_neighbours = np.linspace(a/2,(self.s-1)-(a/2),self.r)
-        nx, ny = np.meshgrid(nearest_neighbours,nearest_neighbours)
-        for r_i, (y, x) in enumerate(zip(nx.flatten(), ny.flatten())):
+        a = (self.s/self.r)/2
+        nearest_neighbours = np.linspace(0, (self.s-a), self.r)
+        ny, nx = np.meshgrid(nearest_neighbours, nearest_neighbours)
+        for r_sq_i, (x, y) in enumerate(zip(nx.flatten(), ny.flatten())):
             x_0, x_1 = np.floor(x).astype(int), np.ceil(x).astype(int)
             y_0, y_1 = np.floor(y).astype(int), np.ceil(y).astype(int)
             if x_1 == x_0:
@@ -45,116 +45,98 @@ class FullyConvolutionalFractionalScaling2D(torch.nn.Module):
             if y_1 == y_0:
                 y_1 += 1
 
-            weight[r_i,0, 0, x_0, y_0] = (x_1-x)*(y_1-y)
-            if y_1 < kernel_size:
-                weight[r_i,0, 0, x_0, y_1] = (x_1-x)*(y-y_0)
-            if x_1 < kernel_size:
-                weight[r_i,0, 0, x_1, y_0] = (x-x_0)*(y_1-y)
-            if (x_1 < kernel_size) and (y_1 < kernel_size):
-                weight[r_i,0, 0, x_1, y_1] = (x-x_0)*(y-y_0)
+            weight[r_sq_i,0, 0, x_0, y_0] += (x_1-x)*(y_1-y)
+            weight[r_sq_i,0, 0, x_0, min(y_1,kernel_size-1)] += (x_1-x)*(y-y_0)
+            weight[r_sq_i,0, 0, min(x_1,kernel_size-1), y_0] += (x-x_0)*(y_1-y)
+            weight[r_sq_i,0, 0, min(x_1,kernel_size-1), min(y_1,kernel_size-1)] += (x-x_0)*(y-y_0)
 
         weight = torch.Tensor(weight)
         return weight
 
     def fill_weights_BiQubic(self)->torch.Tensor:
-        kernel_size = self.s+1
+        kernel_size = self.s+3
         weight = np.zeros([self.r**2,1,1, kernel_size, kernel_size])
-        a = self.s/self.r
-        nearest_neighbours = np.linspace(a/2,(self.s-1)-(a/2),self.r)
-        nx, ny = np.meshgrid(nearest_neighbours,nearest_neighbours)
-        def get_weight(t,s):
-            a = -0.5
-            x = np.abs(t-s)
-            if np.abs((t-s)==0):
-                return 1
-            elif 0 < x and x <= 1:
-                return (a+2)*(np.abs(t-s)**3)-(a+3)*((t-s)**2)+1
-            elif 1 < x and x < 2:
-                return (a)*(np.abs(t-s)**3)-(5*a)*((t-s)**2)+(8*a)*np.abs(t-s)-(4*a)
+        a = (self.s/self.r)/2
+        nearest_neighbours = np.linspace(1, (self.s), self.r)
+        # print(nearest_neighbours)
+
+        ny, nx = np.meshgrid(nearest_neighbours,nearest_neighbours)
+        def get_weight(d):
+            a = -1.
+            x = np.abs(d)
+            # if x==0:
+            #     return 1
+            if 0 <= x and x < 1:
+                return ((a+2.)*(x**3))-((a+3.)*(x**2))+1
+            elif 1 <= x and x < 2:
+                return (a*(x**3))-((5.*a)*(x**2))+(8.*a*x)-(4.*a)
             else:
                 return 0
-        for r_i, (y, x) in enumerate(zip(nx.flatten(), ny.flatten())):
+
+        for r_i, (x, y) in enumerate(zip(nx.flatten(), ny.flatten())):
             x_0, x_1, x_2, x_3 = np.floor(x).astype(int)-1, np.floor(x).astype(int), np.ceil(x).astype(int),np.ceil(x).astype(int)+1
             y_0, y_1, y_2, y_3 = np.floor(y).astype(int)-1, np.floor(y).astype(int), np.ceil(y).astype(int),np.ceil(y).astype(int)+1
-            x_0, y_0 = np.max([0,x_0]), np.max([0,y_0])
-            x_3, y_3 = np.min([kernel_size-1,x_3]), np.min([kernel_size-1,y_3])
+            if x_1 == x_2:
+                x_2 += 1
+                x_3 += 1
+            if y_1 == y_2:
+                y_2 += 1
+                y_3 += 1
+            # x_0, y_0 = np.max([0,x_0]), np.max([0,y_0])
+            # x_3, y_3 = np.min([kernel_size-1,x_3]), np.min([kernel_size-1,y_3])
 
             Ax = np.zeros((1,4))
-            Ax[0,2] = get_weight(x_2,x)
-            Ax[0,1] = get_weight(x_1,x)
-            Ax[0,3] = get_weight(x_3,x)
-            Ax[0,0] = get_weight(x_0,x)
+            Ax[0,0] = get_weight(x-x_0)
+            Ax[0,1] = get_weight(x-x_1)
+            Ax[0,2] = get_weight(x_2-x)
+            Ax[0,3] = get_weight(x_3-x)
 
             Ay = np.zeros((1,4))
-            Ay[0,2] = get_weight(y_2,y)
-            Ay[0,1] = get_weight(y_1,y)
-            Ay[0,3] = get_weight(y_3,y)
-            Ay[0,0] = get_weight(y_0,y)
+            Ay[0,0] = get_weight(y-y_0)
+            Ay[0,1] = get_weight(y-y_1)
+            Ay[0,2] = get_weight(y_2-y)
+            Ay[0,3] = get_weight(y_3-y)
 
             W = Ay.T@Ax
-
-            if (x_3 < kernel_size) and (0<=x_0) and (y_3 < kernel_size) and (0 <= y_0):
-                weight[r_i,0, 0, x_0:x_3+1, y_0:y_3+1] = W[0:x_3-x_0+1,0:y_3-y_0+1] / ((W[0:x_3-x_0+1,0:y_3-y_0+1]).sum() if (W[0:x_3-x_0+1,0:y_3-y_0+1]).sum() > 0 else 1)
-            elif (x_3 < kernel_size) and (0<=x_0) and (y_3 < kernel_size+1) and (0 <= y_0):
-                weight[r_i,0, 0, x_0:x_3+1, y_0:y_2+1] = W[:,y_0:y_2+1]/(W[:,y_0:y_2+1]).sum()
-            elif (x_3 < kernel_size+1) and (0<=x_0) and (y_3 < kernel_size) and (0 < y_0):
-                weight[r_i,0, 0, x_0:x_2+1, y_0:y_3+1] = W[x_0:x_2+1,:]/(W[x_0:x_2+1,:]).sum()
-            elif (x_3 < kernel_size+1) and (0<=x_0) and (y_3 < kernel_size+1) and (0 <= y_0):
-                weight[r_i,0, 0, x_0:x_2+1, y_0:y_2+1] = W[x_0:x_2+1,y_0:y_2+1]/(W[x_0:x_2+1,y_0:y_2+1]).sum()
-            elif (x_3 < kernel_size) and (0<=x_0) and (y_3 < kernel_size+2) and (0 <= y_0):
-                weight[r_i,0, 0, x_0:x_3+1, y_0:y_1+1] = W[:,y_0:y_1+1]/(W[:,y_0:y_1+1]).sum()
-            elif (x_3 < kernel_size+2) and (0<=x_0) and (y_3 < kernel_size) and (0 <=y_0):
-                weight[r_i,0, 0, x_0:x_1+1, y_0:y_3+1] = W[x_0:x_1+1,:]/(W[x_0:x_1+1,:]).sum()
-            elif (x_3 < kernel_size+1) and (0<=x_0) and (y_3 < kernel_size+2) and (0 <= y_0):
-                weight[r_i,0, 0, x_0:x_2+1, y_0:y_1+1] = W[x_0:x_2+1,y_0:y_1+1]/(W[x_0:x_2+1,y_0:y_1+1]).sum()
-            elif (x_3 < kernel_size+2) and (0<=x_0) and (y_3 < kernel_size+1) and (0 <=y_0):
-                weight[r_i,0, 0, x_0:x_1+1, y_0:y_2+1] = W[x_0:x_1+1,y_0:y_2+1]/(W[x_0:x_1+1,y_0:y_2+1]).sum()
-            elif (x_3 < kernel_size+2) and (0<=x_0) and (y_3 < kernel_size+2) and (0 <= y_0):
-                weight[r_i,0, 0, x_0:x_1+1, y_0:y_1+1] = W[x_0:x_1+1,y_0:y_1+1]/(W[x_0:x_1+1,y_0:y_1+1]).sum()
-            else:
-                weight[r_i,0, 0, x_1, y_1]=1
-        weight = torch.Tensor(weight, device=self.device)
+            W = W/W.sum()
+            # print(W.shape)
+            # print(W)
+            # print(y_0,y_1,y_2,y_3)
+            # print(x_0,x_1,x_2,x_3)
+            # if (x_3 < kernel_size) and (0<=x_0) and (y_3 < kernel_size) and (0 <= y_0):
+            weight[r_i,0, 0,x_0:x_0+4,y_0:y_0+4] = W# if (W[0:x_3-x_0+1,0:y_3-y_0+1]).sum() > 0 else 1)
+        weight = torch.Tensor(weight)
         return weight
 
 
     def __init__(self,
                  r:             int,
                  s:             int,
-                 scaling_mode: str='nearest',
-                 is_inner_layer: bool=False) -> None:
+                 scaling_mode: str=cv2.INTER_NEAREST,
+                 is_inner_layer: bool=False,
+                 device=None) -> None:
         super(FullyConvolutionalFractionalScaling2D, self).__init__()
         self.r = r
         self.s = s
         self.K = 8
         self.is_inner_layer = is_inner_layer
+        self.device = device
         self.scaling_modes = {
-            'bicubic':  self.fill_weights_BiQubic,
-            'nearest':  self.fill_weights_NN,
-            'bilinear': self.fill_weights_BiLinear
+            cv2.INTER_CUBIC:  self.fill_weights_BiQubic,
+            cv2.INTER_NEAREST:  self.fill_weights_NN,
+            cv2.INTER_LINEAR: self.fill_weights_BiLinear
         }
         self.pooling_kernel = self.scaling_modes[scaling_mode]()
+        self.pooling_kernel = self.pooling_kernel.to(self.device) if (self.device is not None) else self.pooling_kernel
         self.gaussian_blur = torchvision.transforms.functional.gaussian_blur
         self.pixelshuffle = torch.nn.PixelShuffle(self.r)#self.fill_weights_BiLInear(r, s)
-    # def pixelshuffle(self, input: torch.Tensor) -> torch.Tensor:
-    #     H,W = input.shape[-2:]
-    #     H_n = (H//self.K)+1 if H%self.K != 0 else (H//self.K)
-    #     W_n = (W//self.K)+1 if W%self.K != 0 else (W//self.K)
-    #     res = []#[[None for j in range(0,W_n)] for i in range(0,H_n)]
-    #     for i in range(0, H_n):
-    #         res.append([])
-    #         for j in range(0, W_n):
-    #             res[-1].append(F.pixel_shuffle(input[..., i * self.K:(i + 1) * self.K, j * self.K:(j + 1) * self.K], self.r))
-    #             torch.cuda.empty_cache()
-    #         res[-1] = torch.concat(res[-1],dim=-1)
-    #         torch.cuda.empty_cache()
-    #     res = torch.concat(res,dim=-2)
-    #     return res
+
     def conv3d(self,input):
         kernel_size = self.s+1
         padding_shape = self.compute_padding(kernel_size)
         padding = F.pad(input,pad=[padding_shape,padding_shape,padding_shape,padding_shape,0,0],mode='replicate')
         filtered_input = F.conv3d(padding, \
-                                      self.pooling_kernel.to(input.device), \
+                                      self.pooling_kernel.to(input.device) if (self.device is None) else self.pooling_kernel, \
                                       stride=[1,self.s,self.s], \
                                       padding='valid', \
                                       bias=None)
@@ -167,7 +149,7 @@ class FullyConvolutionalFractionalScaling2D(torch.nn.Module):
         else:
             x = input
         return x
-    def decode_image(self, x, input: torch.Tensor):
+    def decode_image(self, x: torch.Tensor, input: torch.Tensor):
         if not self.is_inner_layer:
             res = torch.permute(x, (0,2,3,1))
             if len(input.shape) == 3:
