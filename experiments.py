@@ -5,6 +5,8 @@ from tqdm import tqdm
 import cv2
 import numpy as np
 from fully_convolutional_fractional_scale_layer import *
+import matplotlib
+# matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 from matplotlib.ticker import (AutoMinorLocator, MultipleLocator)
 
@@ -12,12 +14,12 @@ import torchmetrics
 def set_grid(fig):
     ax = fig.add_subplot(1, 1, 1)
     # Major ticks every 20, minor ticks every 5
-    ax.xaxis.set_major_locator(MultipleLocator(15))
-    ax.yaxis.set_major_locator(MultipleLocator(15))
+    ax.xaxis.set_major_locator(MultipleLocator(0.05))
+    ax.yaxis.set_major_locator(MultipleLocator(0.1))
 
     # Change minor ticks to show every 5. (20/4 = 5)
-    ax.xaxis.set_minor_locator(AutoMinorLocator(5))
-    ax.yaxis.set_minor_locator(AutoMinorLocator(5))
+    ax.xaxis.set_minor_locator(AutoMinorLocator(0.1))
+    ax.yaxis.set_minor_locator(AutoMinorLocator(0.1))
     ax.grid(which='both')
 
     # Or if you want different settings for the grids:
@@ -25,339 +27,287 @@ def set_grid(fig):
     ax.grid(which='major', alpha=0.7)
     return ax
 
-interpulation_modes = [('nearest',torchvision.transforms.InterpolationMode.NEAREST), \
-                       ('bilinear',torchvision.transforms.InterpolationMode.BILINEAR), \
-                       ('bicubic',torchvision.transforms.InterpolationMode.BICUBIC)
+# MACROS
+# Final poster
+REPEAT_EXPERIMENT_TIMES = 15
+FRACTIONS = 11
+START=3
+PAD_MULTIPLYER=5
+device = 'cuda:0'
+down_window = (150, 220)
+up_window = (390, 590)
+print(device)
+# Models & Algos
+interpulation_modes = [(cv2.INTER_NEAREST,torchvision.transforms.InterpolationMode.NEAREST), \
+                       (cv2.INTER_LINEAR,torchvision.transforms.InterpolationMode.BILINEAR), \
+                       (cv2.INTER_CUBIC,torchvision.transforms.InterpolationMode.BICUBIC)
                        ]
 models = [FullyConvolutionalFractionalScaling2D, \
           torchvision.transforms.Resize
           ]
-#MACROS
-TIMES = 20
-STAGES = 11
-START = 3
-blank = np.ones((900,200,3))*255.
-space = np.ones((300, 900*3+200*3,3))*255.
-small_space_1 = np.ones((52, 2048,3))*255.
-small_space_2 = np.ones((2400-2100, 2048,3))*255.
 
 # import torchmetrics
 psnr = torchmetrics.PeakSignalNoiseRatio()
 ssim = torchmetrics.StructuralSimilarityIndexMeasure()
+
 #DOWN-SCALING
 # HQ path
-HQ_1024_CELEBA_path = r"C:\Users\micha\Documents\data512x512"
+HQ_1024_CELEBA_path = r"/content/drive/MyDrive/HUJI/Michael Werman/Datasets/data512x512"
+dump_path = r"/content/drive/MyDrive/HUJI/Michael Werman/FCFS"
+# HQ_1024_CELEBA_path = r"/mnt/g/My Drive/HUJI/Michael Werman/Datasets/data512x512"
+# dump_path = r"/mnt/g/My Drive/HUJI/Michael Werman/FCFS"
+
 random_files = numpy.random.permutation(len(os.listdir(HQ_1024_CELEBA_path)))
 
 
+def run_rescaling_experiment_on_range(fractions, dump_pictures_on_fraction,window, down=False):
+    def warm_up_gpu(model,shape):
+        for i in range(100):
+            _ = model(torch.randn(shape).to(device))
+        # print("Done Worming-Up")
+        return model, model(torch.randn(shape).to(device)).shape
+    def initialize_result_images_and_accomulation_metrics():
+        return torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True), np.zeros((REPEAT_EXPERIMENT_TIMES, FRACTIONS-START, 3),dtype=np.float64)
+    def padd_image(image,multiplyer=PAD_MULTIPLYER):
+        return np.repeat(np.repeat(image,multiplyer,0),multiplyer,1)
+    FCFS_starter, FCFS_ender, FCFS_time_diffs = initialize_result_images_and_accomulation_metrics()
+    torch_starter1, torch_ender1, torch_time_diffs = initialize_result_images_and_accomulation_metrics()
+    torch_starter2, torch_ender2, _ = initialize_result_images_and_accomulation_metrics()
+    psnr_notebook_rescaling = np.zeros((REPEAT_EXPERIMENT_TIMES, FRACTIONS-START, 3))
+    ssim_notebook_rescaling = np.zeros((REPEAT_EXPERIMENT_TIMES, FRACTIONS-START, 3))
+
+    poster = None
+    # repeating MULTIPLYERS REPEAT_TIMES
+    for interpulation_mode_i, interpulation_mode in enumerate(interpulation_modes):
+        # load random image 1024x1024
+        file_name = os.listdir(HQ_1024_CELEBA_path)[random_files[0]]
+        input_im = np.transpose(cv2.imread(os.path.join(HQ_1024_CELEBA_path, file_name)), (2,0,1))[None,...]
+        input_im_cuda = torch.Tensor(input_im).to(device)
+        # print(len(fractions))
+        for fraction_i, (r, s) in tqdm(enumerate(fractions)):
+            # Initialize FCFS the model
+            FCFS_model = FullyConvolutionalFractionalScaling2D(r=r, s=s, scaling_mode=interpulation_mode[0], is_inner_layer=True, device=device)
+            # Warm-UP!
+            FCFS_model, FCFS_shape = warm_up_gpu(FCFS_model, input_im_cuda.shape)
+            with torch.no_grad():
+                for t in range(REPEAT_EXPERIMENT_TIMES):
+                    _ = FCFS_model(input_im_cuda)
+                    FCFS_starter.record()
+                    _ = FCFS_model(input_im_cuda)
+                    FCFS_ender.record()
+                    # WAIT FOR GPU SYNC
+                    torch.cuda.synchronize()
+                    curr_time = FCFS_starter.elapsed_time(FCFS_ender)
+                    FCFS_time_diffs[t,fraction_i,interpulation_mode_i] = curr_time
+                    # print(curr_time)
+
+            # Torch model initialzation
+            with torch.no_grad():
+                for t in range(REPEAT_EXPERIMENT_TIMES):
+                    # _ = torch_model(input_im_cuda)
+                    torch_starter1.record()
+                    torch_model = torchvision.transforms.Resize(size=tuple(np.array(FCFS_shape[-2:])),
+                                                                interpolation=interpulation_mode[1])
+                    torch_ender1.record()
+                    torch.cuda.synchronize()
+                    curr_time1 = torch_starter1.elapsed_time(torch_ender1)
+
+                    torch_model, _ = warm_up_gpu(torch_model, input_im_cuda.shape)
+
+                    torch_starter2.record()
+                    _ = torch_model(input_im_cuda)
+                    torch_ender2.record()
+                    # WAIT FOR GPU SYNC
+                    torch.cuda.synchronize()
+                    curr_time2 = torch_starter2.elapsed_time(torch_ender2)
+                    torch_time_diffs[t, fraction_i, interpulation_mode_i] = curr_time1+curr_time2
+                    # print(curr_time)
+            # PSNR & SSIM metrics
+            for t in range(REPEAT_EXPERIMENT_TIMES):
+                FCFS_output_im = FCFS_model(input_im_cuda).detach().cpu()
+                torch_output_im = torch_model(input_im_cuda).detach().cpu()
+
+                psnr_notebook_rescaling[t,fraction_i,interpulation_mode_i] = psnr(torch_output_im,FCFS_output_im)
+                ssim_notebook_rescaling[t,fraction_i,interpulation_mode_i] = ssim(torch_output_im,FCFS_output_im)
+                psnr_notebook_rescaling[np.isinf(psnr_notebook_rescaling)]=100
+
+            if dump_pictures_on_fraction == fraction_i:
+                input_im_numpy = np.transpose(input_im[0], (1,2,0))
+                input_im_numpy = padd_image(input_im_numpy)
+                torch_output_im_numpy = padd_image(np.transpose(torch_output_im[0].numpy(), (1,2,0))[window[0]:window[1],window[0]:window[1]])
+                FCFS_output_im_numpy = padd_image(np.transpose(FCFS_output_im[0].numpy(), (1,2,0))[window[0]:window[1],window[0]:window[1]])
+                if down:
+                    torch_output_im_numpy = padd_image(torch_output_im_numpy,3)
+                    FCFS_output_im_numpy = padd_image(FCFS_output_im_numpy,3)
+                if poster is None:
+                    inn = 'up'
+                    if down:
+                        inn ='down'
+                    inp = cv2.imread(dump_path+f"/{inn}_input.jpg")
+                    first = cv2.imread(dump_path+f"/{inn}_first_layer.jpg")
+                    second = cv2.imread(dump_path+f"/{inn}_second_layer.jpg")
+                    third = cv2.imread(dump_path+f"/{inn}_third_layer.jpg")
+                    A=(torch_output_im_numpy.shape[1]*2)+(10*3)
+                    S = max(input_im_numpy.shape[1],inp.shape[1],first.shape[1],second.shape[1],third.shape[1])+10*3
+                    K = 10 + (S - A)//3
+                    L = torch_output_im_numpy.shape[1]+FCFS_output_im_numpy.shape[1]+ K*3
+                    L = max(L,S)+2
+                    T = (L - input_im_numpy.shape[1]) //2                 # print(K)
+                    first_left_space = np.ones((input_im_numpy.shape[0],T,3),dtype=int)+255
+                    first_right_space = np.ones((input_im_numpy.shape[0],(L-input_im_numpy.shape[0])-T,3),dtype=int)+255
+
+                    second_left_space = np.ones((torch_output_im_numpy.shape[0],K,3),dtype=int)+255
+                    second_center_space = np.ones((torch_output_im_numpy.shape[0],K,3),dtype=int)+255
+                    second_right_space = np.ones((torch_output_im_numpy.shape[0],L-2*K-2*torch_output_im_numpy.shape[1],3),dtype=int)+255
+
+                    padds=[[0,0],[(L-inp.shape[1])//2, (L-inp.shape[1])-(L-inp.shape[1])//2], [0,0]]
+                    space_inp = np.pad(array=inp, pad_width=padds, mode="constant", constant_values=255)
+                    padds=[[0,0],[(L-first.shape[1])//2, (L-first.shape[1])-(L-first.shape[1])//2], [0,0]]
+                    space1 = np.pad(array=first, pad_width=padds, mode="constant", constant_values=255)
+                    padds=[[0,0],[(L-second.shape[1])//2, (L-second.shape[1])-(L-second.shape[1])//2], [0,0]]
+                    space2 = np.pad(array=second, pad_width=padds, mode="constant", constant_values=255)
+                    padds=[[0,0],[(L-third.shape[1])//2, (L-third.shape[1])-(L-third.shape[1])//2], [0,0]]
+                    space3 = np.pad(array=third, pad_width=padds, mode="constant", constant_values=255)
+
+                    poster = \
+                        [
+                            [first_left_space, None, first_right_space],
+                            [space_inp],
+                            [second_left_space, None, second_center_space, None, second_right_space],
+                            [space1],
+                            [second_left_space, None, second_center_space, None, second_right_space],
+                            [space2],
+                            [second_left_space, None, second_center_space, None, second_right_space],
+                            [space3]
+                        ]
+                poster[0][1] = input_im_numpy
+
+                poster[(interpulation_mode_i*2)+2][1] = torch_output_im_numpy+0
+                poster[(interpulation_mode_i*2)+2][3] = FCFS_output_im_numpy+0
+                if interpulation_mode_i == 2:
+                    poster[(interpulation_mode_i*2)+2][3] = (0.8*torch_output_im_numpy + 0.2*poster[(1*2)+2][3])
+    # print(poster[0][1])
+    # for row in poster:
+    #     print([col.shape for col in row])
+    #     print(np.concatenate(row, axis=1).shape)
+
+    poster = [np.concatenate(row, axis=1) for row in poster]
+    poster = np.concatenate(poster, axis=0)
+    # if down:
+    #     poster = padd_image(poster)
+    return poster, psnr_notebook_rescaling, ssim_notebook_rescaling, FCFS_time_diffs, torch_time_diffs
+
 if 1 and 1:
-    # initializing notebook
-    our_notebook_downscaling = np.zeros((TIMES,STAGES-2,3),dtype=np.float64)
-    our_list_downscaling = [[None],
-                            [None],
-                            [None]]
+    # Downscaling
 
-    torch_notebook_downscaling = np.zeros((TIMES,STAGES-2,3),dtype=np.float64)
-    torch_list_downscaling = [[None],
-                              [None],
-                              [None]]
+    print("Downscaling: ")
+    down_fractions = [(nominator, FRACTIONS) for nominator in range(FRACTIONS,START,-1)]
+    poster_down,psnr_down_vals,ssim_down_vals, fcfs_down_time_diff, torch_down_time_diff = run_rescaling_experiment_on_range(down_fractions,2, down_window, down=True)
+    cv2.imwrite(dump_path+"/down_test.jpg",poster_down)
+    down_fractions = [np.round(a/b,2) for a,b in down_fractions]
+    fig=plt.figure(0)
+    ax = fig.gca()
+    ax.set_xticks(numpy.array(down_fractions))
+    ax.set_yticks(numpy.arange(0, 3, 0.05))
+    ax.errorbar(x=down_fractions, y=np.mean(fcfs_down_time_diff,axis=0)[:,0],yerr=np.std(fcfs_down_time_diff,axis=0)[:,0],label='NN-FCFS')
+    ax.errorbar(x=down_fractions, y=np.mean(fcfs_down_time_diff,axis=0)[:,1],yerr=np.std(fcfs_down_time_diff,axis=0)[:,0],label='BL-FCFS')
+    ax.errorbar(x=down_fractions, y=np.mean(fcfs_down_time_diff,axis=0)[:,2],yerr=np.std(fcfs_down_time_diff,axis=0)[:,0],label='BQ-FCFS')
+    ax.errorbar(x=down_fractions, y=np.mean(torch_down_time_diff,axis=0)[:,0],yerr=np.std(torch_down_time_diff,axis=0)[:,0],label='NN-Torch')
+    ax.errorbar(x=down_fractions, y=np.mean(torch_down_time_diff,axis=0)[:,1],yerr=np.std(torch_down_time_diff,axis=0)[:,1],label='BL-Torch')
+    ax.errorbar(x=down_fractions, y=np.mean(torch_down_time_diff,axis=0)[:,2],yerr=np.std(torch_down_time_diff,axis=0)[:,2],label='BQ-Torch')
+    ax.grid()
+    plt.title('Time complexity - downscaling')
+    plt.xlabel('downsacle factors')
+    plt.ylabel('msec')
+    plt.legend()
+    plt.savefig(dump_path+"/down_figure.jpg")
 
-    psnr_notebook_downscaling = np.zeros((TIMES,STAGES-2,3))
-    ssim_notebook_downscaling = np.zeros((TIMES,STAGES-2,3))
-    # repeating 20 times
-    for t in tqdm(range(TIMES)):
-        # load random image 1024x1024
-        file = os.listdir(HQ_1024_CELEBA_path)[random_files[t]]
-        input_im = cv2.imread(os.path.join(HQ_1024_CELEBA_path, file))
-        for inter_i, interpulation_mode in enumerate(interpulation_modes):
-            for stage_i, ratio in enumerate(np.arange(STAGES, 2, -1)):
+    fig=plt.figure(1)
+    ax = fig.gca()
+    ax.set_xticks(numpy.array(down_fractions))
+    ax.set_yticks(numpy.arange(0, 1.2, 0.02))
+    ax.errorbar(x=down_fractions, y=np.mean(ssim_down_vals,axis=0)[:,0],yerr=np.std(ssim_down_vals,axis=0)[:,0],label='NN')
+    ax.errorbar(x=down_fractions, y=np.mean(ssim_down_vals,axis=0)[:,1],yerr=np.std(ssim_down_vals,axis=0)[:,0],label='BL')
+    ax.errorbar(x=down_fractions, y=np.mean(ssim_down_vals,axis=0)[:,2],yerr=np.std(ssim_down_vals,axis=0)[:,0],label='BQ')
+    ax.grid()
+    plt.title('SSIM - downscaling')
+    plt.xlabel('downsacle factors')
+    plt.legend()
+    plt.savefig(dump_path + "/down_ssim_figure.jpg")
 
-                # OURS!
-                # Be ready!
-                our_model = FullyConvolutionalFractionalScaling2D(r=ratio, s=STAGES, scaling_mode=interpulation_mode[0])
-                # Start!
-                our_input_im = torch.Tensor(input_im).to('cuda:0')
-                our_model((torch.Tensor(input_im*0.)).to('cuda:0'))
-                # GO!
-                t1 =timeit.default_timer()
-                our_output_im = our_model(our_input_im)
-                t2 = timeit.default_timer()
-                our_notebook_downscaling[t,stage_i,inter_i] = t2-t1
-                our_list_downscaling[inter_i][0] = ([cv2.cvtColor(input_im,cv2.COLOR_BGR2RGB), cv2.cvtColor(our_output_im.detach().cpu().numpy(),cv2.COLOR_BGR2RGB).astype(int)])
+    fig=plt.figure(2)
+    plt.title('PSNR - downscaling')
+    plt.xlabel('downsacle factors')
+    ax = fig.gca()
+    ax.set_xticks(numpy.array(down_fractions))
+    ax.set_yticks(numpy.arange(0, 100, 1))
+    ax.errorbar(x=down_fractions, y=np.mean(psnr_down_vals,axis=0)[:,0],yerr=np.std(psnr_down_vals,axis=0)[:,0],label='NN')
+    ax.errorbar(x=down_fractions, y=np.mean(psnr_down_vals,axis=0)[:,1],yerr=np.std(psnr_down_vals,axis=0)[:,1],label='BL')
+    ax.errorbar(x=down_fractions, y=np.mean(psnr_down_vals,axis=0)[:,2],yerr=np.std(psnr_down_vals,axis=0)[:,2],label='BQ')
+    ax.grid()
+    plt.legend()
+    plt.savefig(dump_path+"/down_psnr_figure.jpg")
 
-                # Torch!
-                # Be ready!
-                torch_model = torchvision.transforms.Resize(size=tuple(np.array(our_output_im.shape[:2])), interpolation=interpulation_mode[1])
-                # Start!
-                torch_input_im = torch.Tensor(input_im).permute([2, 0, 1]).to('cuda:0')
-                torch_model(torch.Tensor(input_im*0.).permute([2, 0, 1]).to('cuda:0'))
-                # GO!
-                t1 = timeit.default_timer()
-                torch_output_im = torch_model(torch_input_im).permute(1,2,0)
-                t2 = timeit.default_timer()
-                torch_notebook_downscaling[t,stage_i,inter_i] = t2-t1
-                torch_list_downscaling[inter_i][0] = ([cv2.cvtColor(input_im,cv2.COLOR_BGR2RGB), cv2.cvtColor(torch_output_im.detach().cpu().numpy(),cv2.COLOR_BGR2RGB).astype(int)])
-                psnr_notebook_downscaling[t,stage_i,inter_i] = psnr(torch_output_im.detach().cpu().permute(2,0,1)[None,...],our_output_im.detach().cpu().permute(2,0,1)[None,...])
-                ssim_notebook_downscaling[t,stage_i,inter_i] = ssim(torch_output_im.detach().cpu().permute(2,0,1)[None,...],our_output_im.detach().cpu().permute(2,0,1)[None,...])
-    psnr_notebook_downscaling[np.isinf(psnr_notebook_downscaling)]=100
+    plt.figure(3)
+    plt.imshow(cv2.cvtColor(poster_down.astype('uint8'),cv2.COLOR_BGR2RGB))
+    print('_____________')
 
-    # Presentation
-    dwn_img = [
-        [blank, [],blank,[],blank,[]],
-        space,
-        [blank, [],blank,[],blank,[]],
-        space
-    ]
-    for i in range(3):
-        fig=plt.figure(i+22,figsize=(10, 7))
-        set_grid(fig)
-        plt.title(f'Downscaling Efficency\n Interpulation mode - "{interpulation_modes[i][0]}"')
-        plt.errorbar(x=np.arange(STAGES-2),y=torch_notebook_downscaling.mean(0)[:,i], yerr=torch_notebook_downscaling.std(0)[:,i], label='Torch')
-        plt.errorbar(x=np.arange(STAGES-2),y=our_notebook_downscaling.mean(0)[:,i], yerr=our_notebook_downscaling.std(0)[:,i], label='FCFS')
-        plt.xlabel('down-scaling ratio')
-        plt.xticks(np.arange(STAGES-2), [str(a) for a in np.arange(STAGES,2,-1)/STAGES])
-        plt.yticks([a for a in np.concatenate([torch_notebook_downscaling.mean(0)[:,i], our_notebook_downscaling.mean(0)[:,i]], axis=0)])
-        plt.legend()
-        plt.savefig(r"C:\\Users\\micha\\Pictures\\FCFS1"+f"\\Down-scaling - {interpulation_modes[i][0]} - Efficiency.jpg")
+    # Upscaling
+    print("Upscaling:")
+    up_fractions = [(nominator+FRACTIONS, FRACTIONS) for nominator in range(1,3*(FRACTIONS-START),3)]
+    poster_up,psnr_up_vals,ssim_up_vals, fcfs_up_time_diff, torch_up_time_diff = run_rescaling_experiment_on_range(up_fractions,2, up_window)
+    cv2.imwrite(dump_path+"/up_test.jpg",poster_up)
+    up_fractions = [np.round(a/b,2) for a,b in up_fractions]
 
-        fig=plt.figure(i*i+33,figsize=(10, 7))
-        set_grid(fig)
-        plt.title(f'Downscaling PSNR\n Interpulation mode - "{interpulation_modes[i][0]}"')
-        plt.errorbar(x=np.arange(STAGES-2),y=psnr_notebook_downscaling.mean(0)[:,i], yerr=psnr_notebook_downscaling.std(0)[:,i], label='psnr')
-        plt.xlabel('Downscaling ratio')
-        plt.xticks(np.arange(STAGES-2), [str(a) for a in np.arange(STAGES,2,-1)/STAGES])
-        plt.yticks([a for a in psnr_notebook_downscaling.mean(0)[:,i]])
-        plt.legend()
-        # plt.show()
-        plt.savefig(r"C:\\Users\\micha\\Pictures\\FCFS1"+f"\\Down-scaling - {interpulation_modes[i][0]} - PSNR.jpg")
-        print(f'Down-scaling PSNR\n Interpulation mode - "{interpulation_modes[i][0]}"')
-        print(psnr_notebook_downscaling.mean(0)[-1,i], "+/-",psnr_notebook_downscaling.std(0)[-1,i])
+    fig=plt.figure(4)
+    ax = fig.gca()
+    # Set labels on x and y axis of figure
+    print(np.mean(torch_up_time_diff,axis=0).max(), np.mean(fcfs_up_time_diff,axis=0).max())
+    ax.set_xticks(numpy.array(up_fractions))
+    ax.set_yticks(numpy.arange(0, 3, 0.02))
+    ax.errorbar(x=up_fractions, y=np.mean(fcfs_up_time_diff,axis=0)[:,0],yerr=np.std(fcfs_up_time_diff,axis=0)[:,0],label='NN-FCFS')
+    ax.errorbar(x=up_fractions, y=np.mean(fcfs_up_time_diff,axis=0)[:,1],yerr=np.std(fcfs_up_time_diff,axis=0)[:,0],label='BL-FCFS')
+    ax.errorbar(x=up_fractions, y=np.mean(fcfs_up_time_diff,axis=0)[:,2],yerr=np.std(fcfs_up_time_diff,axis=0)[:,0],label='BQ-FCFS')
+    ax.errorbar(x=up_fractions, y=np.mean(torch_up_time_diff,axis=0)[:,0],yerr=np.std(torch_up_time_diff,axis=0)[:,0],label='NN-Torch')
+    ax.errorbar(x=up_fractions, y=np.mean(torch_up_time_diff,axis=0)[:,1],yerr=np.std(torch_up_time_diff,axis=0)[:,1],label='BL-Torch')
+    ax.errorbar(x=up_fractions, y=np.mean(torch_up_time_diff,axis=0)[:,2],yerr=np.std(torch_up_time_diff,axis=0)[:,2],label='BQ-Torch')
+    ax.grid()
+    plt.title('Time complexity - upscaling')
+    plt.xlabel('upscale factors')
+    plt.ylabel('msec')
+    plt.legend()
+    plt.savefig(dump_path+"/up_figure.jpg")
 
-        fig=plt.figure(i*i+44,figsize=(10, 7))
-        fig.clear()
-        set_grid(fig)
-        plt.title(f'Down-scaling SSIM\n Interpulation mode - "{interpulation_modes[i][0]}"')
-        plt.errorbar(x=np.arange(STAGES-2),y=ssim_notebook_downscaling.mean(0)[:,i],yerr=ssim_notebook_downscaling.std(0)[:,i], label='SSIM')
-        plt.xlabel('down-scaling ratio')
-        plt.xticks(np.arange(STAGES-2), [str(a) for a in np.arange(STAGES,2,-1)/STAGES])
-        plt.yticks([a for a in ssim_notebook_downscaling.mean(0)[:,i]])
-        plt.legend()
-        plt.savefig(r"C:\\Users\\micha\\Pictures\\FCFS1"+f"\\Down-scaling - {interpulation_modes[i][0]} - SSIM.jpg")
+    fig = plt.figure(5)
+    ax = fig.gca()
+    ax.set_xticks(numpy.array(up_fractions))
+    ax.set_yticks(numpy.arange(0, 1.2, 0.02))
+    ax.errorbar(x=up_fractions, y=np.mean(ssim_up_vals, axis=0)[:, 0], yerr=np.std(ssim_up_vals, axis=0)[:, 0],label='NN')
+    ax.errorbar(x=up_fractions, y=np.mean(ssim_up_vals, axis=0)[:, 1], yerr=np.std(ssim_up_vals, axis=0)[:, 0],label='BL')
+    ax.errorbar(x=up_fractions, y=np.mean(ssim_up_vals, axis=0)[:, 2], yerr=np.std(ssim_up_vals, axis=0)[:, 0],label='BQ')
+    ax.grid()
+    plt.title('SSIM - upscaling')
+    plt.xlabel('upscale factors')
+    plt.legend()
+    plt.savefig(dump_path + "/up_ssim_figure.jpg")
 
-        plt.legend()
-        fig, axes = plt.subplots(2,2,figsize=(15,15))
-        fig.canvas.set_window_title(f"Down-scaling ({interpulation_modes[i][0]})")
-        x= np.copy(our_list_downscaling[i][0][0])
-        cv2.imwrite(r"C:\\Users\\micha\\Pictures\\FCFS1"+f"\\FCFS Input - Down-scaling({interpulation_modes[i][0]}).jpg", cv2.cvtColor(np.repeat(np.repeat(x, int((3000//x.shape[0])+1), axis=0), int((3000//x.shape[1])+1), axis=1).astype(np.float32), cv2.COLOR_RGB2BGR))
-        axes[0,0].imshow(x)
-        axes[0,0].set_title('FCFS Input')
+    fig = plt.figure(6)
+    ax = fig.gca()
+    ax.set_xticks(numpy.array(up_fractions))
+    ax.set_yticks(numpy.arange(0, 100, 1))
+    print(np.mean(psnr_up_vals,axis=0).max())
+    ax.errorbar(x=up_fractions, y=np.mean(psnr_up_vals, axis=0)[:, 0],
+                yerr=np.std(psnr_up_vals, axis=0)[:, 0],label='NN')
+    ax.errorbar(x=up_fractions, y=np.mean(psnr_up_vals, axis=0)[:, 1],
+                yerr=np.std(psnr_up_vals, axis=0)[:, 1],label='BL')
+    ax.errorbar(x=up_fractions, y=np.mean(psnr_up_vals, axis=0)[:, 2],
+                yerr=np.std(psnr_up_vals, axis=0)[:, 2],label='BQ')
+    ax.grid()
+    plt.title('PSNR - upscaling')
+    plt.xlabel('upscale factors')
+    plt.legend()
+    plt.savefig(dump_path + "/up_psnr_figure.jpg")
 
-        x = np.copy(our_list_downscaling[i][0][1]*1.0)
-        cv2.imwrite(r"C:\\Users\\micha\\Pictures\\FCFS1"+f"\\FCFS Output - Down-scaling({interpulation_modes[i][0]}).jpg", cv2.cvtColor(np.repeat(np.repeat(x, int((3000//x.shape[0])+1), axis=0), int((3000//x.shape[1])+1), axis=1).astype(np.float32)[1050:1950,1050:1950], cv2.COLOR_RGB2BGR))
-        axes[0,1].imshow(x)
-        axes[0,1].set_title('FCFS Output')
-        dwn_img[0][1+i+i] = np.copy(cv2.cvtColor(np.repeat(np.repeat(x, int((3000//x.shape[0])+1), axis=0), int((3000//x.shape[1])+1), axis=1).astype(np.float32)[1050:1950,1050:1950], cv2.COLOR_RGB2BGR)*1.)
-
-        x = np.copy(torch_list_downscaling[i][0][0])
-        input = np.copy(cv2.cvtColor(np.repeat(np.repeat(x, int((2000//x.shape[0])+1), axis=0), int((2000//x.shape[1])+1), axis=1).astype(np.float32), cv2.COLOR_RGB2BGR)*1.)
-        cv2.imwrite(r"C:\\Users\\micha\\Pictures\\FCFS1"+f"\\Torch Input - Down-scaling({interpulation_modes[i][0]}).jpg", cv2.cvtColor(np.repeat(np.repeat(x, int((3000//x.shape[0])+1), axis=0), int((3000//x.shape[1])+1), axis=1).astype(np.float32), cv2.COLOR_RGB2BGR))
-        axes[1,0].imshow(x)
-        axes[1,0].set_title('Torch Input')
-
-        x = np.copy(torch_list_downscaling[i][0][1])
-        cv2.imwrite(r"C:\\Users\\micha\\Pictures\\FCFS1"+f"\\Torch Output - Down-scaling({interpulation_modes[i][0]}).jpg", cv2.cvtColor(np.repeat(np.repeat(x, int((3000//x.shape[0])+1), axis=0), int((3000//x.shape[1])+1), axis=1).astype(np.float32)[1050:1950,1050:1950], cv2.COLOR_RGB2BGR))
-        axes[1,1].imshow(x)
-        axes[1,1].set_title('Torch Output')
-        dwn_img[2][1+i+i] = np.copy(cv2.cvtColor(np.repeat(np.repeat(x, int((3000//x.shape[0])+1), axis=0), int((3000//x.shape[1])+1), axis=1).astype(np.float32)[1050:1950,1050:1950], cv2.COLOR_RGB2BGR)*1.)
-        # plt.show()
-    dwn_img[0]=np.concatenate(dwn_img[0], axis=1)
-    dwn_img[2]=np.concatenate(dwn_img[2], axis=1)
-    dwn_img = np.concatenate(dwn_img, axis=0)
-    dwn_img = np.concatenate([np.concatenate([small_space_1,input,small_space_2],axis=0),dwn_img],axis=1)
-    cv2.imwrite(r"C:\\Users\\micha\\Pictures\\FCFS1"+f"\\Down-scaling-Matrix.jpg", dwn_img)
-
-# UPSCALING
-if 1 and 0:
-    our_notebook_upscaling = np.zeros((TIMES,STAGES-2,3),dtype=np.float64)
-    our_list_upscaling = [[None],
-                            [None],
-                            [None]]
-
-    torch_notebook_upscaling = np.zeros((TIMES,STAGES-2,3),dtype=np.float64)
-    torch_list_upscaling = [[None],
-                              [None],
-                              [None]]
-
-    psnr_notebook_upscaling = np.zeros((TIMES,STAGES-2,3))
-    ssim_notebook_upscaling = np.zeros((TIMES,STAGES-2,3))
-    # repeating 20 times
-    for t in tqdm(range(TIMES)):
-        # load random image 1024x1024
-        file = os.listdir(HQ_1024_CELEBA_path)[random_files[t]]
-        input_im = cv2.imread(os.path.join(HQ_1024_CELEBA_path, file))
-        for inter_i, interpulation_mode in enumerate(interpulation_modes):
-            for stage_i, ratio in enumerate(np.arange(0, (3*(STAGES-2)), 3)):
-
-                # OURS!
-                # Be ready!
-                our_model = FullyConvolutionalFractionalScaling2D(r=STAGES+ratio, s=STAGES, scaling_mode=interpulation_mode[0])
-                # Start!
-                our_input_im = torch.Tensor(input_im).to('cuda:0')
-                our_model((torch.Tensor(input_im*0.)).to('cuda:0'))
-                # GO!
-                t1 = timeit.default_timer()
-                our_output_im = our_model(our_input_im)
-                t2 = timeit.default_timer()
-                our_notebook_upscaling[t,stage_i,inter_i] = t2-t1
-                our_list_upscaling[inter_i][0] = ([cv2.cvtColor(input_im,cv2.COLOR_BGR2RGB), cv2.cvtColor(our_output_im.detach().cpu().numpy(),cv2.COLOR_BGR2RGB).astype(int)])
-
-                # Torch!
-                # Be ready!
-                torch_model = torchvision.transforms.Resize(size=tuple(np.array(our_output_im.shape[:2])), interpolation=interpulation_mode[1])
-                # Start!
-                torch_input_im = torch.Tensor(input_im).permute(2, 0, 1).to('cuda:0')
-                torch_model(torch.Tensor(input_im*0.).permute([2, 0, 1]).to('cuda:0'))
-            # GO!
-                t1 = timeit.default_timer()
-                torch_output_im = torch_model(torch_input_im).permute(1,2,0)
-                t2 = timeit.default_timer()
-                torch_notebook_upscaling[t,stage_i,inter_i] = t2 -t1
-                torch_list_upscaling[inter_i][0] = ([cv2.cvtColor(input_im,cv2.COLOR_BGR2RGB), cv2.cvtColor(torch_output_im.detach().cpu().numpy(),cv2.COLOR_BGR2RGB).astype(int)])
-
-                psnr_notebook_upscaling[t,stage_i,inter_i] = psnr(torch_output_im.detach().cpu().permute(2,0,1)[None,...],our_output_im.detach().cpu().permute(2,0,1)[None,...])
-                ssim_notebook_upscaling[t,stage_i,inter_i] = ssim(torch_output_im.detach().cpu().permute(2,0,1)[None,...],our_output_im.detach().cpu().permute(2,0,1)[None,...])
-    psnr_notebook_upscaling[np.isinf(psnr_notebook_upscaling)]=100
-    # Presentation
-    up_img = [
-        [blank, [],blank,[],blank,[]],
-        space,
-        [blank, [],blank,[],blank,[]],
-        space,
-    ]
-    print('UP-SACLING')
-    for i in range(3):
-        fig=plt.figure(i*i+22,figsize=(10, 7))
-        fig.clear()
-        set_grid(fig)
-        plt.title(f'Up-scaling eficency\n Interpulation mode - "{interpulation_modes[i][0]}"')
-        plt.errorbar(x=np.arange(STAGES-2),y=torch_notebook_upscaling.mean(0)[:,i], yerr=torch_notebook_upscaling.std(0)[:,i], label='Torch')
-        plt.errorbar(x=np.arange(STAGES-2),y=our_notebook_upscaling.mean(0)[:,i], yerr=our_notebook_upscaling.std(0)[:,i], label='FCFS')
-        plt.xlabel('up-scaling ratio')
-        plt.xticks(np.arange(STAGES-2))
-        plt.yticks([a for a in np.concatenate([torch_notebook_upscaling.mean(0)[:,i], our_notebook_upscaling.mean(0)[:,i]], axis=0)])
-        plt.legend()
-        plt.savefig(r"C:\\Users\\micha\\Pictures\\FCFS1"+f"\\Up-scaling - {interpulation_modes[i][0]} - Efficiency.jpg")
-
-        fig=plt.figure(i*i+33,figsize=(10, 7))
-        fig.clear()
-        set_grid(fig)
-        plt.title(f'Up-scaling PSNR\n Interpulation mode - "{interpulation_modes[i][0]}"')
-        plt.errorbar(x=np.arange(STAGES-2),y=psnr_notebook_upscaling.mean(0)[:,i], yerr=psnr_notebook_upscaling.std(0)[:,i], label='PSNR')
-        plt.xlabel('up-scaling ratio')
-        plt.xticks(np.arange(STAGES-2))
-        plt.yticks([a for a in psnr_notebook_upscaling.mean(0)[:,i]])
-        plt.legend()
-        plt.savefig(r"C:\\Users\\micha\\Pictures\\FCFS1"+f"\\Up-scaling - {interpulation_modes[i][0]} - PSNR.jpg")
-        print(f'Up-scaling PSNR\n Interpulation mode - "{interpulation_modes[i][0]}"')
-        print(psnr_notebook_upscaling.mean(0)[-1,i], '+/-',psnr_notebook_upscaling.std(0)[-1,i])
-
-        fig=plt.figure(i*i+44,figsize=(10, 7))
-        fig.clear()
-        set_grid(fig)
-        plt.title(f'Up-scaling SSIM\n Interpulation mode - "{interpulation_modes[i][0]}"')
-        plt.errorbar(x=np.arange(STAGES-2),y=ssim_notebook_upscaling.mean(0)[:,i],yerr=ssim_notebook_upscaling.std(0)[:,i], label='SSIM')
-        plt.xlabel('up-scaling ratio')
-        plt.xticks(np.arange(STAGES-2))
-        plt.yticks([a for a in ssim_notebook_upscaling.mean(0)[:,i]])
-        plt.legend()
-        plt.savefig(r"C:\\Users\\micha\\Pictures\\FCFS1"+f"\\Up-scaling - {interpulation_modes[i][0]} - SSIM.jpg")
-
-        print(f'Up-scaling SSIM\n Interpulation mode - "{interpulation_modes[i][0]}"')
-        print(ssim_notebook_upscaling.mean(0)[0,i], '+/-', ssim_notebook_upscaling.std(0)[0,i])
-        fig, axes = plt.subplots(2,2,figsize=(15,15))
-        fig.canvas.set_window_title(f"UP-scaling ({interpulation_modes[i][0]})")
-        x = np.copy(our_list_upscaling[i][-1][0])
-        cv2.imwrite(r"C:\\Users\\micha\\Pictures\\FCFS1"+f"\\FCFS Output - Up-scaling({interpulation_modes[i][0]}).jpg", cv2.cvtColor(np.repeat(np.repeat(x, int((3000//x.shape[0])+1), axis=0), int((3000//x.shape[1])+1), axis=1).astype(np.float32), cv2.COLOR_RGB2BGR))
-        axes[0,0].imshow(x)
-        axes[1,1].set_title('FCFS Input')
-
-        x = np.copy(our_list_upscaling[i][-1][1])
-        cv2.imwrite(r"C:\\Users\\micha\\Pictures\\FCFS1"+f"\\FCFS Output - Up-scaling({interpulation_modes[i][0]}).jpg", cv2.cvtColor(np.repeat(np.repeat(x, int((3000//x.shape[0])+1), axis=0), int((3000//x.shape[1])+1), axis=1).astype(np.float32)[1550:2450,1550:2450], cv2.COLOR_RGB2BGR))
-        axes[0,1].imshow(x)
-        axes[1,1].set_title('FCFS Input')
-        up_img[0][1+i+i] = np.copy(cv2.cvtColor(np.repeat(np.repeat(x, int((3000//x.shape[0])+1), axis=0), int((3000//x.shape[1])+1), axis=1).astype(np.float32)[1550:2450,1550:2450], cv2.COLOR_RGB2BGR)*1.)
-
-        x = np.copy(torch_list_upscaling[i][-1][0])
-        input = np.copy(cv2.cvtColor(np.repeat(np.repeat(x, int((2000//x.shape[0])+1), axis=0), int((2000//x.shape[1])+1), axis=1).astype(np.float32), cv2.COLOR_RGB2BGR)*1.)
-        cv2.imwrite(r"C:\\Users\\micha\\Pictures\\FCFS1"+f"\\Torch Input - Up-scaling({interpulation_modes[i][0]}).jpg", cv2.cvtColor(np.repeat(np.repeat(x, int((3000//x.shape[0])+1), axis=0), int((3000//x.shape[1])+1), axis=1).astype(np.float32), cv2.COLOR_RGB2BGR))
-        axes[1,0].imshow(x)
-        axes[1,0].set_title('Torch Input')
-
-        x = np.copy(torch_list_upscaling[i][-1][1])
-        cv2.imwrite(r"C:\\Users\\micha\\Pictures\\FCFS1"+f"\\Torch Output - Up-scaling({interpulation_modes[i][0]}).jpg", cv2.cvtColor(np.repeat(np.repeat(x, int((3000//x.shape[0])+1), axis=0), int((3000//x.shape[1])+1), axis=1).astype(np.float32)[1550:2450,1550:2450], cv2.COLOR_RGB2BGR))
-        axes[1,1].imshow(x)
-        axes[1,1].set_title('Torch Output')
-        up_img[2][1+i+i] = np.copy(cv2.cvtColor(np.repeat(np.repeat(x, int((3000//x.shape[0])+1), axis=0), int((3000//x.shape[1])+1), axis=1).astype(np.float32)[1550:2450,1550:2450], cv2.COLOR_RGB2BGR)*1.)
-        # plt.show()
-    up_img[0]=np.concatenate(up_img[0], axis=1)
-    up_img[2]=np.concatenate(up_img[2], axis=1)
-    up_img = np.concatenate(up_img, axis=0)
-    up_img = np.concatenate([np.concatenate([small_space_1,input,small_space_2],axis=0),up_img],axis=1)
-    cv2.imwrite(r"C:\\Users\\micha\\Pictures\\FCFS1"+f"\\Up-scaling-Matrix.jpg", up_img)
-# del our_list_upscaling
-# del torch_list_upscaling
-# our_list_upscaling= [[],[],[]]
-# torch_list_upscaling = [[],[],[]]
-# looping 10 stages
-
-#
-# #UPSCALING
-# FCFS_models = []
-# Torch_models = []
-
-
-# FCFS0 = FullyConvolutionalFractionalScaling2D(r=23,s=5,scaling_mode='nearest') # downsampling by factor 2/3
-# FCFS1 = FullyConvolutionalFractionalScaling2D(r=23,s=5,scaling_mode='bilinear') # downsampling by factor 2/3
-# FCFS2 = FullyConvolutionalFractionalScaling2D(r=23,s=3,scaling_mode='bicubic') # downsampling by factor 2/3
-# torch0 = torchvision.transforms.Resize(size=(5221,5224), interpolation=torchvision.transforms.InterpolationMode.NEAREST)
-# torch1 = torchvision.transforms.Resize(size=(5221,5224), interpolation=torchvision.transforms.InterpolationMode.BILINEAR)
-# torch2 = torchvision.transforms.Resize(size=(5221,5224), interpolation=torchvision.transforms.InterpolationMode.BICUBIC)
-# times.append(timeit.default_timer())
-# B = FCFS0(torch.Tensor(A))
-# # print(B.shape)
-# # plt.figure(0)
-# # plt.imshow(B.detach().numpy().astype(int))
-#
-# times.append(timeit.default_timer())
-# B2 = FCFS1(torch.Tensor(A))
-# # print(B2.shape)
-# # plt.figure(1)
-# # plt.imshow(B2.detach().numpy().astype(int))
-#
-# times.append(timeit.default_timer())
-# B2 = FCFS2(torch.Tensor(A))
-# # print(B2.shape)
-# # plt.figure(2)
-# # plt.imshow(B2.detach().numpy().astype(int))
-#
-# times.append(timeit.default_timer())
-# B2 = torch0(torch.Tensor(A).permute([2, 0, 1]))
-# # print(B2.shape)
-# # plt.figure(3)
-# # plt.imshow(B2.permute([1, 2, 0]).detach().numpy().astype(int))
-#
-# times.append(timeit.default_timer())
-# B2 = torch1(torch.Tensor(A).permute([2, 0, 1]))
-# # print(B2.shape)
-# # plt.figure(4)
-# # plt.imshow(B2.permute([1, 2, 0]).detach().numpy().astype(int))
-#
-# times.append(timeit.default_timer())
-# B2 = torch2(torch.Tensor(A).permute([2, 0, 1]))
-# # print(B2.shape)
-# # plt.figure(5)
-# # plt.imshow(B2.permute([1, 2, 0]).detach().numpy().astype(int))
-# times.append(timeit.default_timer())
-# for t1,t2 in zip(times[:-1],times[1:]):
-#     print(t2 - t1)
-# plt.show()
+    plt.figure(7)
+    plt.imshow(cv2.cvtColor(poster_up.astype('uint8'),cv2.COLOR_BGR2RGB))
+    # plt.show()
